@@ -229,7 +229,7 @@ async function processUserAudio(connection, userId, guildId, guildName, voiceChN
     const maxBytes = 48000 * 2 * 2 * 20;
 
     const OpusScript = require("opusscript");
-    const decoder = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
+    const decoder = new OpusScript(48000, 2, OpusScript.Application?.AUDIO ?? 2049);
 
     const decodeTransform = new Transform({
       transform(chunk, _enc, cb) {
