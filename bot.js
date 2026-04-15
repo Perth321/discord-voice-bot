@@ -230,11 +230,10 @@ function updatePresenceJoin(guildId, guildName, channelId, channelName, member) 
     });
   }
 
-  const botChannelId = getBotVoiceChannelId(guildId);
-  if (botChannelId && botChannelId === channelId) {
-    const afkKey = `${guildId}-${member.id}`;
+  const afkKey = `${guildId}-${member.id}`;
+  if (!afkTracker.has(afkKey)) {
     afkTracker.set(afkKey, {
-      lastSpeakAt: Date.now(),
+      lastActivityAt: Date.now(),
       warned: false,
       channelId,
       channelName,
@@ -259,11 +258,11 @@ function updatePresenceLeave(guildId, channelId, userId) {
   afkTracker.delete(`${guildId}-${userId}`);
 }
 
-function updatePresenceSpeak(guildId, userId) {
+function updateActivity(guildId, userId) {
   const afkKey = `${guildId}-${userId}`;
   const entry = afkTracker.get(afkKey);
   if (entry) {
-    entry.lastSpeakAt = Date.now();
+    entry.lastActivityAt = Date.now();
     entry.warned = false;
   }
 }
@@ -294,12 +293,12 @@ async function sendPresenceUpdate() {
 async function checkAfkUsers(clientRef) {
   const now = Date.now();
   for (const [afkKey, entry] of afkTracker) {
-    const silentMs = now - entry.lastSpeakAt;
+    const silentMs = now - entry.lastActivityAt;
 
     if (silentMs >= AFK_MUTE_MS && entry.warned) {
       try {
         const freshEntry = afkTracker.get(afkKey);
-        if (!freshEntry || (now - freshEntry.lastSpeakAt) < AFK_MUTE_MS) continue;
+        if (!freshEntry || (now - freshEntry.lastActivityAt) < AFK_MUTE_MS) continue;
 
         const guild = clientRef.guilds.cache.get(entry.guildId);
         if (!guild) { afkTracker.delete(afkKey); continue; }
@@ -337,7 +336,7 @@ async function checkAfkUsers(clientRef) {
         });
 
         console.log(`[AFK] Muted ${entry.username} in ${entry.channelName} (${Math.floor(silentMs / 60000)}min silent)`);
-        entry.lastSpeakAt = now;
+        entry.lastActivityAt = now;
         entry.warned = false;
 
       } catch (err) {
@@ -490,7 +489,7 @@ async function processUserAudio(connection, userId, guildId, guildName, voiceChN
 
 function startListening(connection, guildId, guildName, voiceChannel, textChannel) {
   connection.receiver.speaking.on("start", (userId) => {
-    updatePresenceSpeak(guildId, userId);
+    updateActivity(guildId, userId);
 
     const state = activeGuilds.get(guildId);
     if (!state?.enabled) return;
@@ -550,23 +549,6 @@ async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
         activeGuilds.set(guildId, { enabled: true, textChannelId: textChannel.id });
         startListening(connection, guildId, member.guild.name, voiceChannel, textChannel);
 
-        for (const [, m] of voiceChannel.members) {
-          if (!m.user.bot) {
-            const afkKey = `${guildId}-${m.id}`;
-            afkTracker.set(afkKey, {
-              lastSpeakAt: Date.now(),
-              warned: false,
-              channelId: voiceChannel.id,
-              channelName: voiceChannel.name,
-              guildId,
-              guildName: member.guild.name,
-              userId: m.id,
-              username: m.displayName,
-              avatarUrl: m.user.displayAvatarURL(),
-            });
-          }
-        }
-
         const embed = new EmbedBuilder()
           .setColor(0x57f287)
           .setTitle("🎙️ Voice Translator เปิดแล้ว")
@@ -589,12 +571,9 @@ async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
     case "vleave": {
       const conn = getVoiceConnection(guildId);
       if (!conn) { await textChannel.send("❌ บอทไม่ได้อยู่ในห้อง voice ครับ"); return; }
-      for (const [key, entry] of afkTracker) {
-        if (entry.guildId === guildId) afkTracker.delete(key);
-      }
       conn.destroy();
       activeGuilds.delete(guildId);
-      await textChannel.send("👋 ออกจากห้อง voice แล้วครับ — Voice Translator ปิดแล้ว");
+      await textChannel.send("👋 ออกจากห้อง voice แล้วครับ — Voice Translator ปิดแล้ว (ระบบ AFK ยังทำงานอยู่)");
       break;
     }
     case "von": {
@@ -799,6 +778,16 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     updatePresenceLeave(guildId, oldCh.id, member.id);
     updatePresenceJoin(guildId, guildName, newCh.id, newCh.name, member);
   } else {
+    if (newCh) {
+      const muteChanged = oldState.selfMute !== newState.selfMute || oldState.serverMute !== newState.serverMute;
+      const deafChanged = oldState.selfDeaf !== newState.selfDeaf || oldState.serverDeaf !== newState.serverDeaf;
+      const streamChanged = oldState.streaming !== newState.streaming;
+      const videoChanged = oldState.selfVideo !== newState.selfVideo;
+      if (muteChanged || deafChanged || streamChanged || videoChanged) {
+        updateActivity(guildId, member.id);
+        console.log(`[AFK] Activity reset for ${username} (state change in ${newCh.name})`);
+      }
+    }
     return;
   }
   sendPresenceUpdate().catch(() => {});
