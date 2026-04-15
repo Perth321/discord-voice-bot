@@ -203,6 +203,15 @@ const AFK_MUTE_MS = 5 * 60 * 1000;
 const AFK_CHECK_INTERVAL = 15 * 1000;
 const PRESENCE_SEND_INTERVAL = 20 * 1000;
 
+function getBotVoiceChannelId(guildId) {
+  const state = activeGuilds.get(guildId);
+  if (!state) return null;
+  const { getVoiceConnection: getVC } = require("@discordjs/voice");
+  const conn = getVC(guildId);
+  if (!conn) return null;
+  return conn.joinConfig?.channelId || null;
+}
+
 function updatePresenceJoin(guildId, guildName, channelId, channelName, member) {
   if (!voicePresence.has(guildId)) {
     voicePresence.set(guildId, { guildId, guildName, channels: new Map() });
@@ -220,18 +229,22 @@ function updatePresenceJoin(guildId, guildName, channelId, channelName, member) 
       joinedAt: Date.now(),
     });
   }
-  const afkKey = `${guildId}-${member.id}`;
-  afkTracker.set(afkKey, {
-    lastSpeakAt: Date.now(),
-    warned: false,
-    channelId,
-    channelName,
-    guildId,
-    guildName,
-    userId: member.id,
-    username: member.displayName,
-    avatarUrl: member.user.displayAvatarURL(),
-  });
+
+  const botChannelId = getBotVoiceChannelId(guildId);
+  if (botChannelId && botChannelId === channelId) {
+    const afkKey = `${guildId}-${member.id}`;
+    afkTracker.set(afkKey, {
+      lastSpeakAt: Date.now(),
+      warned: false,
+      channelId,
+      channelName,
+      guildId,
+      guildName,
+      userId: member.id,
+      username: member.displayName,
+      avatarUrl: member.user.displayAvatarURL(),
+    });
+  }
 }
 
 function updatePresenceLeave(guildId, channelId, userId) {
@@ -285,8 +298,11 @@ async function checkAfkUsers(clientRef) {
 
     if (silentMs >= AFK_MUTE_MS && entry.warned) {
       try {
+        const freshEntry = afkTracker.get(afkKey);
+        if (!freshEntry || (now - freshEntry.lastSpeakAt) < AFK_MUTE_MS) continue;
+
         const guild = clientRef.guilds.cache.get(entry.guildId);
-        if (!guild) continue;
+        if (!guild) { afkTracker.delete(afkKey); continue; }
         const member = guild.members.cache.get(entry.userId);
         if (!member || !member.voice.channel) {
           afkTracker.delete(afkKey);
@@ -534,6 +550,23 @@ async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
         activeGuilds.set(guildId, { enabled: true, textChannelId: textChannel.id });
         startListening(connection, guildId, member.guild.name, voiceChannel, textChannel);
 
+        for (const [, m] of voiceChannel.members) {
+          if (!m.user.bot) {
+            const afkKey = `${guildId}-${m.id}`;
+            afkTracker.set(afkKey, {
+              lastSpeakAt: Date.now(),
+              warned: false,
+              channelId: voiceChannel.id,
+              channelName: voiceChannel.name,
+              guildId,
+              guildName: member.guild.name,
+              userId: m.id,
+              username: m.displayName,
+              avatarUrl: m.user.displayAvatarURL(),
+            });
+          }
+        }
+
         const embed = new EmbedBuilder()
           .setColor(0x57f287)
           .setTitle("🎙️ Voice Translator เปิดแล้ว")
@@ -556,6 +589,9 @@ async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
     case "vleave": {
       const conn = getVoiceConnection(guildId);
       if (!conn) { await textChannel.send("❌ บอทไม่ได้อยู่ในห้อง voice ครับ"); return; }
+      for (const [key, entry] of afkTracker) {
+        if (entry.guildId === guildId) afkTracker.delete(key);
+      }
       conn.destroy();
       activeGuilds.delete(guildId);
       await textChannel.send("👋 ออกจากห้อง voice แล้วครับ — Voice Translator ปิดแล้ว");
