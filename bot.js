@@ -9,6 +9,9 @@ if (!token) throw new Error("กรุณาตั้งค่า DISCORD_BOT_TO
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || null;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
+const TRANSLATE_PROXY_URL = process.env.WEBHOOK_URL
+  ? process.env.WEBHOOK_URL.replace("/webhook/voice-translation", "/webhook/translate-audio")
+  : null;
 
 let genai = null;
 try {
@@ -16,10 +19,55 @@ try {
   const geminiKey = process.env.GEMINI_API_KEY;
   if (geminiKey) {
     genai = new GoogleGenAI({ apiKey: geminiKey });
-    console.log("Gemini AI loaded");
+    console.log("Gemini AI loaded (direct)");
   }
-} catch (_) {
-  console.log("Gemini AI not available");
+} catch (_) {}
+
+if (!genai && TRANSLATE_PROXY_URL) {
+  console.log("Gemini AI via Replit proxy: " + TRANSLATE_PROXY_URL);
+} else if (!genai) {
+  console.log("WARNING: No Gemini AI available - translation will not work");
+}
+
+async function callGeminiProxy(audioBase64, mimeType) {
+  if (!TRANSLATE_PROXY_URL) return null;
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (WEBHOOK_SECRET) headers["Authorization"] = `Bearer ${WEBHOOK_SECRET}`;
+    const r = await fetch(TRANSLATE_PROXY_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ audioBase64, mimeType }),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.result || null;
+  } catch (err) {
+    console.error("[Proxy] Error:", err.message);
+    return null;
+  }
+}
+
+async function translateAudioWithGemini(audioBase64, mimeType) {
+  if (genai) {
+    try {
+      const response = await genai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [{
+          role: "user",
+          parts: [
+            { inlineData: { mimeType, data: audioBase64 } },
+            { text: `ฟังเสียงนี้แล้วตอบตามรูปแบบนี้เท่านั้น:\nถ้าเป็นภาษาเวียดนาม ให้ตอบ:\nVIETNAMESE: [คำต้นฉบับภาษาเวียดนาม]\nTHAI: [คำแปลเป็นภาษาไทย]\n\nถ้าไม่ใช่ภาษาเวียดนาม หรือไม่มีเสียงพูดชัดเจน ให้ตอบ:\nNOT_VIETNAMESE` },
+          ],
+        }],
+        config: { maxOutputTokens: 8192 },
+      });
+      return (response.text ?? "").trim();
+    } catch (err) {
+      console.error("[Gemini Direct] Error:", err.message);
+    }
+  }
+  return await callGeminiProxy(audioBase64, mimeType);
 }
 
 async function logEvent(data) {
@@ -211,7 +259,7 @@ async function processUserAudio(connection, userId, guildId, guildName, voiceChN
 
     const guildState = activeGuilds.get(guildId);
     if (!guildState?.enabled) return;
-    if (!genai) return;
+    if (!genai && !TRANSLATE_PROXY_URL) return;
 
     const pcmData = Buffer.concat(pcmChunks);
     const wavData = pcmToWav(pcmData);
@@ -220,26 +268,8 @@ async function processUserAudio(connection, userId, guildId, guildName, voiceChN
 
     console.log(`[Voice] Processing ${(durationMs/1000).toFixed(1)}s audio from ${member.displayName}`);
 
-    const response = await genai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [{
-        role: "user",
-        parts: [
-          { inlineData: { mimeType: "audio/wav", data: wavBase64 } },
-          { text: `ฟังเสียงนี้แล้วตอบตามรูปแบบนี้เท่านั้น:
-ถ้าเป็นภาษาเวียดนาม ให้ตอบ:
-VIETNAMESE: [คำต้นฉบับภาษาเวียดนาม]
-THAI: [คำแปลเป็นภาษาไทย]
-
-ถ้าไม่ใช่ภาษาเวียดนาม หรือไม่มีเสียงพูดชัดเจน ให้ตอบ:
-NOT_VIETNAMESE` },
-        ],
-      }],
-      config: { maxOutputTokens: 8192 },
-    });
-
-    const result = (response.text ?? "").trim();
-    if (result.startsWith("NOT_VIETNAMESE") || !result.includes("VIETNAMESE:")) return;
+    const result = await translateAudioWithGemini(wavBase64, "audio/wav");
+    if (!result || result.startsWith("NOT_VIETNAMESE") || !result.includes("VIETNAMESE:")) return;
 
     const viMatch = result.match(/VIETNAMESE:\s*(.+)/);
     const thMatch = result.match(/THAI:\s*(.+)/);
@@ -385,7 +415,7 @@ async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
 const processingMessages = new Set();
 
 async function handleVoiceMessageTranslation(message) {
-  if (!genai) return;
+  if (!genai && !TRANSLATE_PROXY_URL) return;
   const isVoiceMsg = (message.flags.bitfield & (1 << 13)) !== 0;
   const audioAttachment = message.attachments.find(
     (a) => a.contentType?.startsWith("audio/") || a.name?.endsWith(".ogg") || a.name?.endsWith(".wav") || a.name?.endsWith(".mp3")
@@ -408,26 +438,8 @@ async function handleVoiceMessageTranslation(message) {
     const mime = attachment.contentType || "audio/ogg";
     const durMs = Math.round((attachment.duration ?? 0) * 1000);
 
-    const aiResp = await genai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [{
-        role: "user",
-        parts: [
-          { inlineData: { mimeType: mime, data: base64 } },
-          { text: `ฟังเสียงนี้แล้วตอบตามรูปแบบนี้เท่านั้น:
-ถ้าเป็นภาษาเวียดนาม ให้ตอบ:
-VIETNAMESE: [คำต้นฉบับภาษาเวียดนาม]
-THAI: [คำแปลเป็นภาษาไทย]
-
-ถ้าไม่ใช่ภาษาเวียดนาม หรือไม่มีเสียงพูดชัดเจน ให้ตอบ:
-NOT_VIETNAMESE` },
-        ],
-      }],
-      config: { maxOutputTokens: 8192 },
-    });
-
-    const result = (aiResp.text ?? "").trim();
-    if (result.startsWith("NOT_VIETNAMESE") || !result.includes("VIETNAMESE:")) return;
+    const result = await translateAudioWithGemini(base64, mime);
+    if (!result || result.startsWith("NOT_VIETNAMESE") || !result.includes("VIETNAMESE:")) return;
     const viMatch = result.match(/VIETNAMESE:\s*(.+)/);
     const thMatch = result.match(/THAI:\s*(.+)/);
     if (!viMatch || !thMatch) return;
