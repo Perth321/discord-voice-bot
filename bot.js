@@ -1,10 +1,14 @@
-const { Client, GatewayIntentBits, EmbedBuilder, TextChannel } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder, TextChannel, PermissionsBitField } = require("discord.js");
+const { joinVoiceChannel, VoiceConnectionStatus, entersState, getVoiceConnection, EndBehaviorType } = require("@discordjs/voice");
+const { Transform } = require("stream");
 const { Pool } = require("pg");
 
 const token = process.env.DISCORD_BOT_TOKEN;
 if (!token) throw new Error("กรุณาตั้งค่า DISCORD_BOT_TOKEN");
 
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
+const WEBHOOK_URL = process.env.WEBHOOK_URL || null;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
 
 let genai = null;
 try {
@@ -15,7 +19,7 @@ try {
     console.log("Gemini AI loaded");
   }
 } catch (_) {
-  console.log("Gemini AI not available (no API key)");
+  console.log("Gemini AI not available");
 }
 
 async function logEvent(data) {
@@ -29,6 +33,25 @@ async function logEvent(data) {
        data.fromChannelId ?? null, data.fromChannelName ?? null]
     );
   } catch (_) {}
+}
+
+async function logVoiceTranslation(data) {
+  if (pool) {
+    try {
+      await pool.query(
+        `INSERT INTO voice_translations (guild_id, guild_name, channel_id, channel_name, user_id, username, avatar_url, original_text, translated_text, audio_duration_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [data.guildId, data.guildName, data.channelId, data.channelName, data.userId, data.username, data.avatarUrl, data.originalText, data.translatedText, data.audioDurationMs]
+      );
+    } catch (_) {}
+  }
+  if (WEBHOOK_URL) {
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (WEBHOOK_SECRET) headers["Authorization"] = `Bearer ${WEBHOOK_SECRET}`;
+      await fetch(WEBHOOK_URL, { method: "POST", headers, body: JSON.stringify(data) });
+    } catch (_) {}
+  }
 }
 
 async function getSettings() {
@@ -115,6 +138,332 @@ async function getAiChatReply(channelId, username, userMessage) {
   }
 }
 
+// ===================== VOICE TRANSLATION =====================
+
+function createWavHeader(dataLen, sampleRate, channels, bits) {
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0); h.writeUInt32LE(36 + dataLen, 4);
+  h.write("WAVE", 8); h.write("fmt ", 12);
+  h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(channels, 22); h.writeUInt32LE(sampleRate, 24);
+  h.writeUInt32LE(sampleRate * channels * (bits / 8), 28);
+  h.writeUInt16LE(channels * (bits / 8), 32);
+  h.writeUInt16LE(bits, 34); h.write("data", 36);
+  h.writeUInt32LE(dataLen, 40);
+  return h;
+}
+
+function pcmToWav(pcm, rate = 48000, ch = 2, bits = 16) {
+  return Buffer.concat([createWavHeader(pcm.length, rate, ch, bits), pcm]);
+}
+
+const activeGuilds = new Map();
+const processingUsers = new Set();
+
+function hasPermission(member) {
+  return member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+    member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
+    member.permissions.has(PermissionsBitField.Flags.ManageChannels);
+}
+
+async function processUserAudio(connection, userId, guildId, guildName, voiceChName, voiceChId, textChannel, member) {
+  const key = `${guildId}-${userId}`;
+  if (processingUsers.has(key)) return;
+  processingUsers.add(key);
+
+  try {
+    const opusStream = connection.receiver.subscribe(userId, {
+      end: { behavior: EndBehaviorType.AfterSilence, duration: 2000 },
+    });
+
+    const pcmChunks = [];
+    let totalBytes = 0;
+    const maxBytes = 48000 * 2 * 2 * 20;
+
+    const OpusScript = require("opusscript");
+    const decoder = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
+
+    const decodeTransform = new Transform({
+      transform(chunk, _enc, cb) {
+        try {
+          const decoded = decoder.decode(chunk);
+          if (decoded) this.push(Buffer.from(decoded.buffer, decoded.byteOffset, decoded.byteLength));
+        } catch (_) {}
+        cb();
+      },
+    });
+
+    opusStream.pipe(decodeTransform);
+
+    decodeTransform.on("data", (chunk) => {
+      if (totalBytes < maxBytes) { pcmChunks.push(chunk); totalBytes += chunk.length; }
+    });
+
+    await new Promise((resolve) => {
+      decodeTransform.on("end", resolve);
+      setTimeout(resolve, 22000);
+    });
+
+    opusStream.destroy();
+    decodeTransform.destroy();
+
+    if (totalBytes < 48000 * 2 * 2 * 0.5) return;
+
+    const guildState = activeGuilds.get(guildId);
+    if (!guildState?.enabled) return;
+    if (!genai) return;
+
+    const pcmData = Buffer.concat(pcmChunks);
+    const wavData = pcmToWav(pcmData);
+    const wavBase64 = wavData.toString("base64");
+    const durationMs = Math.round((pcmData.length / (48000 * 2 * 2)) * 1000);
+
+    console.log(`[Voice] Processing ${(durationMs/1000).toFixed(1)}s audio from ${member.displayName}`);
+
+    const response = await genai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{
+        role: "user",
+        parts: [
+          { inlineData: { mimeType: "audio/wav", data: wavBase64 } },
+          { text: `ฟังเสียงนี้แล้วตอบตามรูปแบบนี้เท่านั้น:
+ถ้าเป็นภาษาเวียดนาม ให้ตอบ:
+VIETNAMESE: [คำต้นฉบับภาษาเวียดนาม]
+THAI: [คำแปลเป็นภาษาไทย]
+
+ถ้าไม่ใช่ภาษาเวียดนาม หรือไม่มีเสียงพูดชัดเจน ให้ตอบ:
+NOT_VIETNAMESE` },
+        ],
+      }],
+      config: { maxOutputTokens: 8192 },
+    });
+
+    const result = (response.text ?? "").trim();
+    if (result.startsWith("NOT_VIETNAMESE") || !result.includes("VIETNAMESE:")) return;
+
+    const viMatch = result.match(/VIETNAMESE:\s*(.+)/);
+    const thMatch = result.match(/THAI:\s*(.+)/);
+    if (!viMatch || !thMatch) return;
+
+    const originalText = viMatch[1].trim();
+    const translatedText = thMatch[1].trim();
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setAuthor({ name: member.displayName, iconURL: member.user.displayAvatarURL() })
+      .setTitle("🎙️ Voice Translation: 🇻🇳 → 🇹🇭")
+      .addFields(
+        { name: "Vietnamese (ต้นฉบับ)", value: originalText },
+        { name: "Thai (แปล)", value: translatedText }
+      )
+      .setFooter({ text: `จากห้อง ${voiceChName} • ${(durationMs / 1000).toFixed(1)}s` })
+      .setTimestamp();
+
+    await textChannel.send({ embeds: [embed] }).catch(() => {});
+
+    await logVoiceTranslation({
+      guildId, guildName, channelId: voiceChId, channelName: voiceChName,
+      userId, username: member.displayName,
+      avatarUrl: member.user.displayAvatarURL(),
+      originalText, translatedText, audioDurationMs: durationMs,
+    });
+
+    console.log(`[Voice] Translated: "${originalText}" → "${translatedText}"`);
+  } catch (err) {
+    console.error("[Voice] Processing error:", err.message);
+  } finally {
+    processingUsers.delete(key);
+  }
+}
+
+function startListening(connection, guildId, guildName, voiceChannel, textChannel) {
+  connection.receiver.speaking.on("start", (userId) => {
+    const state = activeGuilds.get(guildId);
+    if (!state?.enabled) return;
+    const member = voiceChannel.guild.members.cache.get(userId);
+    if (!member || member.user.bot) return;
+    processUserAudio(connection, userId, guildId, guildName, voiceChannel.name, voiceChannel.id, textChannel, member);
+  });
+}
+
+async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
+  if (!hasPermission(member)) {
+    await textChannel.send("❌ คุณไม่มีสิทธิ์ใช้คำสั่งนี้ (ต้องเป็น Admin/Moderator)");
+    return;
+  }
+
+  const guildId = member.guild.id;
+
+  switch (command) {
+    case "vjoin": {
+      if (!voiceChannel) {
+        await textChannel.send("❌ คุณต้องอยู่ในห้อง voice ก่อนครับ");
+        return;
+      }
+      const existing = getVoiceConnection(guildId);
+      if (existing) {
+        await textChannel.send("⚠️ บอทอยู่ในห้อง voice อยู่แล้วครับ ใช้ `!vleave` เพื่อออกก่อน");
+        return;
+      }
+      try {
+        const connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId,
+          adapterCreator: member.guild.voiceAdapterCreator,
+          selfDeaf: false,
+          selfMute: true,
+        });
+
+        connection.on("stateChange", (o, n) => {
+          console.log(`[Voice] Connection: ${o.status} → ${n.status}`);
+        });
+
+        connection.on(VoiceConnectionStatus.Disconnected, async () => {
+          try {
+            await Promise.race([
+              entersState(connection, VoiceConnectionStatus.Signalling, 5000),
+              entersState(connection, VoiceConnectionStatus.Connecting, 5000),
+            ]);
+          } catch {
+            connection.destroy();
+            activeGuilds.delete(guildId);
+            console.log("[Voice] Connection destroyed after disconnect");
+          }
+        });
+
+        await entersState(connection, VoiceConnectionStatus.Ready, 30000);
+
+        activeGuilds.set(guildId, { enabled: true, textChannelId: textChannel.id });
+        startListening(connection, guildId, member.guild.name, voiceChannel, textChannel);
+
+        const embed = new EmbedBuilder()
+          .setColor(0x57f287)
+          .setTitle("🎙️ Voice Translator เปิดแล้ว")
+          .setDescription(
+            `เข้าห้อง **${voiceChannel.name}** แล้วครับ\nกำลังฟังภาษาเวียดนามและแปลเป็นไทยอัตโนมัติ`
+          )
+          .addFields({ name: "คำสั่ง", value: "`!voff` ปิดชั่วคราว\n`!von` เปิดใหม่\n`!vleave` ออกจากห้อง" })
+          .setFooter({ text: `เปิดโดย ${member.displayName}` })
+          .setTimestamp();
+        await textChannel.send({ embeds: [embed] });
+        console.log(`[Voice] Joined ${voiceChannel.name} in ${member.guild.name}`);
+      } catch (err) {
+        console.error("[Voice] Join failed:", err.message);
+        const conn = getVoiceConnection(guildId);
+        if (conn) conn.destroy();
+        await textChannel.send("❌ ไม่สามารถเข้าห้อง voice ได้ ลองใหม่อีกครั้งครับ");
+      }
+      break;
+    }
+    case "vleave": {
+      const conn = getVoiceConnection(guildId);
+      if (!conn) { await textChannel.send("❌ บอทไม่ได้อยู่ในห้อง voice ครับ"); return; }
+      conn.destroy();
+      activeGuilds.delete(guildId);
+      await textChannel.send("👋 ออกจากห้อง voice แล้วครับ — Voice Translator ปิดแล้ว");
+      break;
+    }
+    case "von": {
+      const state = activeGuilds.get(guildId);
+      if (!state) { await textChannel.send("❌ บอทไม่ได้อยู่ในห้อง voice ครับ ใช้ `!vjoin` ก่อน"); return; }
+      state.enabled = true;
+      await textChannel.send("✅ Voice Translator **เปิด**แล้วครับ — กำลังฟังภาษาเวียดนาม");
+      break;
+    }
+    case "voff": {
+      const state = activeGuilds.get(guildId);
+      if (!state) { await textChannel.send("❌ บอทไม่ได้อยู่ในห้อง voice ครับ"); return; }
+      state.enabled = false;
+      await textChannel.send("⏸️ Voice Translator **ปิด**ชั่วคราวครับ — ใช้ `!von` เพื่อเปิดใหม่");
+      break;
+    }
+  }
+}
+
+// ===================== VOICE MESSAGE TRANSLATION =====================
+
+const processingMessages = new Set();
+
+async function handleVoiceMessageTranslation(message) {
+  if (!genai) return;
+  const isVoiceMsg = (message.flags.bitfield & (1 << 13)) !== 0;
+  const audioAttachment = message.attachments.find(
+    (a) => a.contentType?.startsWith("audio/") || a.name?.endsWith(".ogg") || a.name?.endsWith(".wav") || a.name?.endsWith(".mp3")
+  );
+  if (!isVoiceMsg && !audioAttachment) return;
+
+  const guildState = activeGuilds.get(message.guild.id);
+  if (!guildState?.enabled) return;
+
+  const attachment = audioAttachment ?? message.attachments.first();
+  if (!attachment?.url) return;
+  if (processingMessages.has(message.id)) return;
+  processingMessages.add(message.id);
+
+  try {
+    const resp = await fetch(attachment.url);
+    if (!resp.ok) return;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    const base64 = buf.toString("base64");
+    const mime = attachment.contentType || "audio/ogg";
+    const durMs = Math.round((attachment.duration ?? 0) * 1000);
+
+    const aiResp = await genai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [{
+        role: "user",
+        parts: [
+          { inlineData: { mimeType: mime, data: base64 } },
+          { text: `ฟังเสียงนี้แล้วตอบตามรูปแบบนี้เท่านั้น:
+ถ้าเป็นภาษาเวียดนาม ให้ตอบ:
+VIETNAMESE: [คำต้นฉบับภาษาเวียดนาม]
+THAI: [คำแปลเป็นภาษาไทย]
+
+ถ้าไม่ใช่ภาษาเวียดนาม หรือไม่มีเสียงพูดชัดเจน ให้ตอบ:
+NOT_VIETNAMESE` },
+        ],
+      }],
+      config: { maxOutputTokens: 8192 },
+    });
+
+    const result = (aiResp.text ?? "").trim();
+    if (result.startsWith("NOT_VIETNAMESE") || !result.includes("VIETNAMESE:")) return;
+    const viMatch = result.match(/VIETNAMESE:\s*(.+)/);
+    const thMatch = result.match(/THAI:\s*(.+)/);
+    if (!viMatch || !thMatch) return;
+
+    const originalText = viMatch[1].trim();
+    const translatedText = thMatch[1].trim();
+    const chName = message.channel.name ?? "unknown";
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setAuthor({ name: message.member?.displayName ?? message.author.username, iconURL: message.author.displayAvatarURL() })
+      .setTitle("🎙️ Voice Translation: 🇻🇳 → 🇹🇭")
+      .addFields(
+        { name: "Vietnamese (ต้นฉบับ)", value: originalText },
+        { name: "Thai (แปล)", value: translatedText }
+      )
+      .setFooter({ text: `Voice Message • ${durMs > 0 ? (durMs / 1000).toFixed(1) + "s" : "audio"}` })
+      .setTimestamp();
+    await message.reply({ embeds: [embed] }).catch(() => {});
+
+    await logVoiceTranslation({
+      guildId: message.guild.id, guildName: message.guild.name,
+      channelId: message.channelId, channelName: chName,
+      userId: message.author.id, username: message.member?.displayName ?? message.author.username,
+      avatarUrl: message.author.displayAvatarURL(),
+      originalText, translatedText, audioDurationMs: durMs || null,
+    });
+  } catch (err) {
+    console.error("[VoiceMsg] Error:", err.message);
+  } finally {
+    processingMessages.delete(message.id);
+  }
+}
+
+// ===================== CLIENT =====================
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -126,13 +475,29 @@ const client = new Client({
 
 client.once("ready", () => {
   console.log(`Bot online: ${client.user.tag}`);
-  client.user.setActivity("ดูการเข้า-ออก voice channel", { type: 3 });
+  client.user.setActivity("🎙️ !vjoin เพื่อแปลเสียง", { type: 3 });
 });
 
 client.on("messageCreate", async (message) => {
   if (message.author.bot || !message.guild) return;
+
+  await handleVoiceMessageTranslation(message);
+
   const content = message.content.trim();
   if (!content) return;
+
+  const voiceCommands = ["!vjoin", "!vleave", "!von", "!voff"];
+  if (voiceCommands.includes(content.toLowerCase())) {
+    const cmd = content.toLowerCase().replace("!", "");
+    const member = message.member;
+    if (!member) return;
+    const voiceChannel = member.voice.channel;
+    const textChannel = message.channel;
+    if (textChannel.isTextBased() && "send" in textChannel) {
+      await handleVoiceCommand(cmd, member, textChannel, voiceChannel);
+    }
+    return;
+  }
 
   const settings = await getSettings();
   if (!settings) return;
