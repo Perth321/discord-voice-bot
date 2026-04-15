@@ -1,26 +1,25 @@
 name: Discord Bot 24/7
 
-  on:
-    schedule:
-      - cron: '0 */5 * * *'
-    workflow_dispatch:
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
 
-  jobs:
-    run-bot:
-      runs-on: ubuntu-latest
-      timeout-minutes: 290
-      steps:
-        - uses: actions/checkout@v4
-        - uses: actions/setup-node@v4
-          with:
-            node-version: '20'
-        - name: Install dependencies
-          run: npm install
-        - name: Run Discord Bot
-          env:
-            DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
-          run: |
-            echo "Bot starting..."
-            timeout 17100 node bot.js || true
-            echo "Bot session ended, will restart on next schedule"
-  
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 290
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install dependencies
+        run: npm install
+      - name: Run Discord Bot
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: |
+          echo 'Bot starting...'
+          timeout 17100 node bot.js || true
+          echo 'Bot session ended, will restart on next schedule'
