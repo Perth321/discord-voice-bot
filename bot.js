@@ -1,16 +1,15 @@
 const { Client, GatewayIntentBits, EmbedBuilder, TextChannel, PermissionsBitField } = require("discord.js");
 const { joinVoiceChannel, VoiceConnectionStatus, entersState, getVoiceConnection, EndBehaviorType } = require("@discordjs/voice");
 const { Transform } = require("stream");
-const { Pool } = require("pg");
 
 const token = process.env.DISCORD_BOT_TOKEN;
 if (!token) throw new Error("กรุณาตั้งค่า DISCORD_BOT_TOKEN");
 
-const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 const WEBHOOK_URL = process.env.WEBHOOK_URL || null;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || null;
-const TRANSLATE_PROXY_URL = process.env.WEBHOOK_URL
-  ? process.env.WEBHOOK_URL.replace("/webhook/voice-translation", "/webhook/translate-audio")
+
+const API_BASE = WEBHOOK_URL
+  ? WEBHOOK_URL.replace("/webhook/voice-translation", "")
   : null;
 
 let genai = null;
@@ -23,27 +22,30 @@ try {
   }
 } catch (_) {}
 
-if (!genai && TRANSLATE_PROXY_URL) {
-  console.log("Gemini AI via Replit proxy: " + TRANSLATE_PROXY_URL);
+if (!genai && API_BASE) {
+  console.log("Gemini AI via Replit proxy: " + API_BASE);
 } else if (!genai) {
   console.log("WARNING: No Gemini AI available - translation will not work");
 }
 
-async function callGeminiProxy(audioBase64, mimeType) {
-  if (!TRANSLATE_PROXY_URL) return null;
+function proxyHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (WEBHOOK_SECRET) h["Authorization"] = `Bearer ${WEBHOOK_SECRET}`;
+  return h;
+}
+
+async function proxyPost(path, body) {
+  if (!API_BASE) return null;
   try {
-    const headers = { "Content-Type": "application/json" };
-    if (WEBHOOK_SECRET) headers["Authorization"] = `Bearer ${WEBHOOK_SECRET}`;
-    const r = await fetch(TRANSLATE_PROXY_URL, {
+    const r = await fetch(`${API_BASE}${path}`, {
       method: "POST",
-      headers,
-      body: JSON.stringify({ audioBase64, mimeType }),
+      headers: proxyHeaders(),
+      body: JSON.stringify(body),
     });
-    if (!r.ok) return null;
-    const data = await r.json();
-    return data.result || null;
+    if (!r.ok) { console.error(`[Proxy] ${path} failed: ${r.status}`); return null; }
+    return await r.json();
   } catch (err) {
-    console.error("[Proxy] Error:", err.message);
+    console.error(`[Proxy] ${path} error:`, err.message);
     return null;
   }
 }
@@ -64,49 +66,80 @@ async function translateAudioWithGemini(audioBase64, mimeType) {
       });
       return (response.text ?? "").trim();
     } catch (err) {
-      console.error("[Gemini Direct] Error:", err.message);
+      console.error("[Gemini Direct] Audio error:", err.message);
     }
   }
-  return await callGeminiProxy(audioBase64, mimeType);
+  const data = await proxyPost("/webhook/translate-audio", { audioBase64, mimeType });
+  return data?.result || null;
+}
+
+async function detectAndTranslate(text) {
+  if (genai) {
+    try {
+      const response = await genai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [{
+          role: "user",
+          parts: [{ text: `ข้อความนี้เป็นภาษาเวียดนามหรือไม่? ถ้าใช่ ให้แปลเป็นภาษาไทยอย่างเดียว ถ้าไม่ใช่ให้ตอบว่า "NO"\n\nข้อความ: "${text}"` }]
+        }],
+      });
+      const result = (response.text ?? "").trim();
+      if (result === "NO" || result.toUpperCase() === "NO") return null;
+      return result;
+    } catch (err) {
+      console.error("[Gemini Direct] Text error:", err.message);
+    }
+  }
+  const data = await proxyPost("/webhook/translate-text", { text });
+  return data?.result || null;
+}
+
+const chatHistory = new Map();
+async function getAiChatReply(channelId, username, userMessage) {
+  if (!chatHistory.has(channelId)) chatHistory.set(channelId, []);
+  const history = chatHistory.get(channelId);
+  history.push({ role: "user", parts: [{ text: `[${username}]: ${userMessage}` }] });
+  const recent = history.slice(-20);
+
+  if (genai) {
+    try {
+      const response = await genai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [
+          { role: "user", parts: [{ text: "คุณคือ AI assistant บน Discord ชื่อ Alxcer ตอบภาษาไทยเสมอ ตอบกระชับ เป็นมิตร" }] },
+          ...recent,
+        ],
+      });
+      const reply = (response.text ?? "").trim() || "ขอโทษครับ ไม่สามารถตอบได้ตอนนี้";
+      history.push({ role: "model", parts: [{ text: reply }] });
+      return reply;
+    } catch (err) {
+      console.error("[Gemini Direct] Chat error:", err.message);
+    }
+  }
+
+  const data = await proxyPost("/webhook/ai-chat", { history: recent, username, message: userMessage });
+  if (data?.reply) {
+    history.push({ role: "model", parts: [{ text: data.reply }] });
+    return data.reply;
+  }
+  return "ขอโทษครับ เกิดข้อผิดพลาด ลองใหม่อีกครั้งนะครับ";
 }
 
 async function logEvent(data) {
-  if (!pool) return;
-  try {
-    await pool.query(
-      `INSERT INTO voice_events (event_type, user_id, username, avatar_url, guild_id, guild_name, channel_id, channel_name, from_channel_id, from_channel_name)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [data.eventType, data.userId, data.username, data.avatarUrl,
-       data.guildId, data.guildName, data.channelId, data.channelName,
-       data.fromChannelId ?? null, data.fromChannelName ?? null]
-    );
-  } catch (_) {}
+  await proxyPost("/webhook/voice-event", data);
 }
 
 async function logVoiceTranslation(data) {
-  if (pool) {
-    try {
-      await pool.query(
-        `INSERT INTO voice_translations (guild_id, guild_name, channel_id, channel_name, user_id, username, avatar_url, original_text, translated_text, audio_duration_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [data.guildId, data.guildName, data.channelId, data.channelName, data.userId, data.username, data.avatarUrl, data.originalText, data.translatedText, data.audioDurationMs]
-      );
-    } catch (_) {}
-  }
-  if (WEBHOOK_URL) {
-    try {
-      const headers = { "Content-Type": "application/json" };
-      if (WEBHOOK_SECRET) headers["Authorization"] = `Bearer ${WEBHOOK_SECRET}`;
-      await fetch(WEBHOOK_URL, { method: "POST", headers, body: JSON.stringify(data) });
-    } catch (_) {}
-  }
+  await proxyPost("/webhook/voice-translation", data);
 }
 
 async function getSettings() {
-  if (!pool) return null;
+  if (!API_BASE) return null;
   try {
-    const r = await pool.query("SELECT * FROM bot_settings WHERE id=1");
-    return r.rows[0] ?? null;
+    const r = await fetch(`${API_BASE}/settings`, { headers: proxyHeaders() });
+    if (!r.ok) return null;
+    return await r.json();
   } catch (_) { return null; }
 }
 
@@ -114,8 +147,8 @@ async function getLogChannel(client, guildId) {
   const guild = client.guilds.cache.get(guildId);
   if (!guild) return null;
   const settings = await getSettings();
-  if (settings?.log_channel_id) {
-    const ch = guild.channels.cache.get(settings.log_channel_id);
+  if (settings?.logChannelId) {
+    const ch = guild.channels.cache.get(settings.logChannelId);
     if (ch instanceof TextChannel) return ch;
   }
   return guild.channels.cache.find(
@@ -142,51 +175,6 @@ function getRemainingTime(userId) {
   if (!entry) return 0;
   return Math.ceil((entry.resetAt - Date.now()) / 60000);
 }
-
-async function detectAndTranslate(text) {
-  if (!genai) return null;
-  try {
-    const response = await genai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [{
-        role: "user",
-        parts: [{ text: `ข้อความนี้เป็นภาษาเวียดนามหรือไม่? ถ้าใช่ ให้แปลเป็นภาษาไทยอย่างเดียว ถ้าไม่ใช่ให้ตอบว่า "NO"\n\nข้อความ: "${text}"` }]
-      }],
-    });
-    const result = (response.text ?? "").trim();
-    if (result === "NO" || result.toUpperCase() === "NO") return null;
-    return result;
-  } catch (err) {
-    console.error("Translation error:", err.message);
-    return null;
-  }
-}
-
-const chatHistory = new Map();
-async function getAiChatReply(channelId, username, userMessage) {
-  if (!genai) return "AI Chat is not configured.";
-  if (!chatHistory.has(channelId)) chatHistory.set(channelId, []);
-  const history = chatHistory.get(channelId);
-  history.push({ role: "user", parts: [{ text: `[${username}]: ${userMessage}` }] });
-  const recent = history.slice(-20);
-  try {
-    const response = await genai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [
-        { role: "user", parts: [{ text: "คุณคือ AI assistant บน Discord ชื่อ Alxcer ตอบภาษาไทยเสมอ ตอบกระชับ เป็นมิตร" }] },
-        ...recent,
-      ],
-    });
-    const reply = (response.text ?? "").trim() || "ขอโทษครับ ไม่สามารถตอบได้ตอนนี้";
-    history.push({ role: "model", parts: [{ text: reply }] });
-    return reply;
-  } catch (err) {
-    console.error("AI Chat error:", err.message);
-    return "ขอโทษครับ เกิดข้อผิดพลาด ลองใหม่อีกครั้งนะครับ";
-  }
-}
-
-// ===================== VOICE TRANSLATION =====================
 
 function createWavHeader(dataLen, sampleRate, channels, bits) {
   const h = Buffer.alloc(44);
@@ -259,7 +247,7 @@ async function processUserAudio(connection, userId, guildId, guildName, voiceChN
 
     const guildState = activeGuilds.get(guildId);
     if (!guildState?.enabled) return;
-    if (!genai && !TRANSLATE_PROXY_URL) return;
+    if (!genai && !API_BASE) return;
 
     const pcmData = Buffer.concat(pcmChunks);
     const wavData = pcmToWav(pcmData);
@@ -410,20 +398,15 @@ async function handleVoiceCommand(command, member, textChannel, voiceChannel) {
   }
 }
 
-// ===================== VOICE MESSAGE TRANSLATION =====================
-
 const processingMessages = new Set();
 
 async function handleVoiceMessageTranslation(message) {
-  if (!genai && !TRANSLATE_PROXY_URL) return;
+  if (!genai && !API_BASE) return;
   const isVoiceMsg = (message.flags.bitfield & (1 << 13)) !== 0;
   const audioAttachment = message.attachments.find(
     (a) => a.contentType?.startsWith("audio/") || a.name?.endsWith(".ogg") || a.name?.endsWith(".wav") || a.name?.endsWith(".mp3")
   );
   if (!isVoiceMsg && !audioAttachment) return;
-
-  const guildState = activeGuilds.get(message.guild.id);
-  if (!guildState?.enabled) return;
 
   const attachment = audioAttachment ?? message.attachments.first();
   if (!attachment?.url) return;
@@ -474,8 +457,6 @@ async function handleVoiceMessageTranslation(message) {
   }
 }
 
-// ===================== CLIENT =====================
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -517,15 +498,15 @@ client.on("messageCreate", async (message) => {
   const channelId = message.channelId;
   let translationChannels = [];
   let aiChatChannels = [];
-  try { translationChannels = JSON.parse(settings.translation_channels || "[]"); } catch {}
-  try { aiChatChannels = JSON.parse(settings.ai_chat_channels || "[]"); } catch {}
+  try { translationChannels = JSON.parse(settings.translationChannels || settings.translation_channels || "[]"); } catch {}
+  try { aiChatChannels = JSON.parse(settings.aiChatChannels || settings.ai_chat_channels || "[]"); } catch {}
 
-  const isAiChat = settings.ai_chat_enabled === 1 && aiChatChannels.includes(channelId);
-  const isTranslation = settings.translation_enabled === 1 &&
-    (settings.translation_all_channels === 1 || translationChannels.includes(channelId));
+  const isAiChat = (settings.aiChatEnabled === 1 || settings.ai_chat_enabled === 1) && aiChatChannels.includes(channelId);
+  const isTranslation = (settings.translationEnabled === 1 || settings.translation_enabled === 1) &&
+    (settings.translationAllChannels === 1 || settings.translation_all_channels === 1 || translationChannels.includes(channelId));
 
   if (isAiChat) {
-    const limit = settings.ai_chat_rate_limit_per_hour || 10;
+    const limit = settings.aiChatRateLimitPerHour || settings.ai_chat_rate_limit_per_hour || 10;
     if (!checkRateLimit(message.author.id, limit)) {
       const remaining = getRemainingTime(message.author.id);
       await message.reply(`❌ คุณใช้งาน AI Chat เกินลิมิต ${limit} ครั้ง/ชั่วโมงแล้วครับ อีก **${remaining} นาที** จึงจะใช้ได้อีก`);
@@ -581,12 +562,18 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     fromChannelId = oldCh.id; fromChannelName = oldCh.name;
     color = 0xfee75c; title = "ย้ายห้อง Voice";
     desc = `**${username}** ย้ายจาก **${oldCh.name}** ไปยัง **${newCh.name}**`;
-  } else return;
+  } else {
+    return;
+  }
 
-  await logEvent({ eventType, userId: member.id, username, avatarUrl, guildId, guildName, channelId, channelName, fromChannelId, fromChannelName });
+  await logEvent({
+    eventType, userId: member.id, username, avatarUrl,
+    guildId, guildName, channelId, channelName,
+    fromChannelId, fromChannelName,
+  });
 
-  const logCh = await getLogChannel(client, guildId);
-  if (logCh) {
+  const logChannel = await getLogChannel(client, guildId);
+  if (logChannel) {
     const embed = new EmbedBuilder()
       .setColor(color)
       .setAuthor({ name: username, iconURL: avatarUrl })
@@ -594,10 +581,18 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
       .setDescription(desc)
       .setTimestamp()
       .setFooter({ text: guildName });
-    await logCh.send({ embeds: [embed] }).catch(() => {});
+    await logChannel.send({ embeds: [embed] }).catch((err) =>
+      console.error("ส่ง embed ไม่ได้:", err.message)
+    );
   }
-  console.log(`[${eventType}] ${username} - ${channelName}`);
+  console.log(`[Event] ${eventType}: ${username} - ${channelName}`);
 });
 
-client.on("error", console.error);
-client.login(token);
+client.on("error", (err) => {
+  console.error("Discord client error:", err.message);
+});
+
+client.login(token).catch((err) => {
+  console.error("Login failed:", err.message);
+  process.exit(1);
+});
