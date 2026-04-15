@@ -196,6 +196,184 @@ function pcmToWav(pcm, rate = 48000, ch = 2, bits = 16) {
 const activeGuilds = new Map();
 const processingUsers = new Set();
 
+const voicePresence = new Map();
+const afkTracker = new Map();
+const AFK_WARN_MS = 3 * 60 * 1000;
+const AFK_MUTE_MS = 5 * 60 * 1000;
+const AFK_CHECK_INTERVAL = 15 * 1000;
+const PRESENCE_SEND_INTERVAL = 20 * 1000;
+
+function updatePresenceJoin(guildId, guildName, channelId, channelName, member) {
+  if (!voicePresence.has(guildId)) {
+    voicePresence.set(guildId, { guildId, guildName, channels: new Map() });
+  }
+  const guild = voicePresence.get(guildId);
+  if (!guild.channels.has(channelId)) {
+    guild.channels.set(channelId, { channelId, channelName, members: new Map() });
+  }
+  const ch = guild.channels.get(channelId);
+  if (!ch.members.has(member.id)) {
+    ch.members.set(member.id, {
+      userId: member.id,
+      username: member.displayName,
+      avatarUrl: member.user.displayAvatarURL(),
+      joinedAt: Date.now(),
+    });
+  }
+  const afkKey = `${guildId}-${member.id}`;
+  afkTracker.set(afkKey, {
+    lastSpeakAt: Date.now(),
+    warned: false,
+    channelId,
+    channelName,
+    guildId,
+    guildName,
+    userId: member.id,
+    username: member.displayName,
+    avatarUrl: member.user.displayAvatarURL(),
+  });
+}
+
+function updatePresenceLeave(guildId, channelId, userId) {
+  const guild = voicePresence.get(guildId);
+  if (!guild) return;
+  const ch = guild.channels.get(channelId);
+  if (ch) {
+    ch.members.delete(userId);
+    if (ch.members.size === 0) guild.channels.delete(channelId);
+  }
+  if (guild.channels.size === 0) voicePresence.delete(guildId);
+  afkTracker.delete(`${guildId}-${userId}`);
+}
+
+function updatePresenceSpeak(guildId, userId) {
+  const afkKey = `${guildId}-${userId}`;
+  const entry = afkTracker.get(afkKey);
+  if (entry) {
+    entry.lastSpeakAt = Date.now();
+    entry.warned = false;
+  }
+}
+
+function buildPresencePayload() {
+  const guilds = [];
+  for (const [, guild] of voicePresence) {
+    const channels = [];
+    for (const [, ch] of guild.channels) {
+      channels.push({
+        channelId: ch.channelId,
+        channelName: ch.channelName,
+        members: Array.from(ch.members.values()),
+      });
+    }
+    if (channels.length > 0) {
+      guilds.push({ guildId: guild.guildId, guildName: guild.guildName, channels });
+    }
+  }
+  return guilds;
+}
+
+async function sendPresenceUpdate() {
+  const guilds = buildPresencePayload();
+  await proxyPost("/webhook/voice-presence", { guilds });
+}
+
+async function checkAfkUsers(clientRef) {
+  const now = Date.now();
+  for (const [afkKey, entry] of afkTracker) {
+    const silentMs = now - entry.lastSpeakAt;
+
+    if (silentMs >= AFK_MUTE_MS && entry.warned) {
+      try {
+        const guild = clientRef.guilds.cache.get(entry.guildId);
+        if (!guild) continue;
+        const member = guild.members.cache.get(entry.userId);
+        if (!member || !member.voice.channel) {
+          afkTracker.delete(afkKey);
+          continue;
+        }
+        if (member.voice.serverMute) continue;
+
+        await member.voice.setMute(true, "AFK เกิน 5 นาที");
+
+        const logChannel = await getLogChannel(clientRef, entry.guildId);
+        if (logChannel) {
+          const embed = new EmbedBuilder()
+            .setColor(0xed4245)
+            .setAuthor({ name: entry.username, iconURL: entry.avatarUrl || undefined })
+            .setTitle("🔇 ปิดไมค์อัตโนมัติ — AFK")
+            .setDescription(
+              `ขออนุญาตปิดไมค์คุณ **${entry.username}** นะครับ เนื่องจากพบการไม่ใช้เสียงเป็นเวลานาน (${Math.floor(silentMs / 60000)} นาที)\n\nสามารถเปิดไมค์ได้เองเมื่อกลับมาครับ 🎙️`
+            )
+            .setFooter({ text: `ห้อง ${entry.channelName}` })
+            .setTimestamp();
+          await logChannel.send({ embeds: [embed] }).catch(() => {});
+        }
+
+        await proxyPost("/webhook/afk-event", {
+          type: "afk-muted",
+          userId: entry.userId,
+          username: entry.username,
+          avatarUrl: entry.avatarUrl,
+          channelName: entry.channelName,
+          guildName: entry.guildName,
+          silentMinutes: Math.floor(silentMs / 60000),
+        });
+
+        console.log(`[AFK] Muted ${entry.username} in ${entry.channelName} (${Math.floor(silentMs / 60000)}min silent)`);
+        entry.lastSpeakAt = now;
+        entry.warned = false;
+
+      } catch (err) {
+        console.error(`[AFK] Mute error for ${entry.username}:`, err.message);
+      }
+    }
+
+    else if (silentMs >= AFK_WARN_MS && !entry.warned) {
+      entry.warned = true;
+      try {
+        const guild = clientRef.guilds.cache.get(entry.guildId);
+        if (!guild) continue;
+        const member = guild.members.cache.get(entry.userId);
+        if (!member || !member.voice.channel) {
+          afkTracker.delete(afkKey);
+          continue;
+        }
+        if (member.voice.serverMute) continue;
+
+        const logChannel = await getLogChannel(clientRef, entry.guildId);
+        if (logChannel) {
+          const remainMin = Math.ceil((AFK_MUTE_MS - silentMs) / 60000);
+          const embed = new EmbedBuilder()
+            .setColor(0xfee75c)
+            .setAuthor({ name: entry.username, iconURL: entry.avatarUrl || undefined })
+            .setTitle("⚠️ แจ้งเตือน AFK")
+            .setDescription(
+              `**${entry.username}** ไม่ได้ใช้เสียงมา ${Math.floor(silentMs / 60000)} นาทีแล้วนะครับ\n\nหากไม่พูดภายใน **${remainMin} นาที** จะถูกปิดไมค์อัตโนมัติครับ 🎙️`
+            )
+            .setFooter({ text: `ห้อง ${entry.channelName}` })
+            .setTimestamp();
+          await logChannel.send({ embeds: [embed] }).catch(() => {});
+        }
+
+        await proxyPost("/webhook/afk-event", {
+          type: "afk-warning",
+          userId: entry.userId,
+          username: entry.username,
+          avatarUrl: entry.avatarUrl,
+          channelName: entry.channelName,
+          guildName: entry.guildName,
+          silentMinutes: Math.floor(silentMs / 60000),
+        });
+
+        console.log(`[AFK] Warning ${entry.username} in ${entry.channelName} (${Math.floor(silentMs / 60000)}min silent)`);
+      } catch (err) {
+        console.error(`[AFK] Warning error for ${entry.username}:`, err.message);
+      }
+    }
+  }
+}
+
 function hasPermission(member) {
   return member.permissions.has(PermissionsBitField.Flags.Administrator) ||
     member.permissions.has(PermissionsBitField.Flags.ManageGuild) ||
@@ -296,6 +474,8 @@ async function processUserAudio(connection, userId, guildId, guildName, voiceChN
 
 function startListening(connection, guildId, guildName, voiceChannel, textChannel) {
   connection.receiver.speaking.on("start", (userId) => {
+    updatePresenceSpeak(guildId, userId);
+
     const state = activeGuilds.get(guildId);
     if (!state?.enabled) return;
     const member = voiceChannel.guild.members.cache.get(userId);
@@ -469,6 +649,22 @@ const client = new Client({
 client.once("ready", () => {
   console.log(`Bot online: ${client.user.tag}`);
   client.user.setActivity("🎙️ !vjoin เพื่อแปลเสียง", { type: 3 });
+
+  for (const guild of client.guilds.cache.values()) {
+    for (const [, ch] of guild.channels.cache) {
+      if (ch.isVoiceBased() && ch.members) {
+        for (const [, member] of ch.members) {
+          if (!member.user.bot) {
+            updatePresenceJoin(guild.id, guild.name, ch.id, ch.name, member);
+          }
+        }
+      }
+    }
+  }
+  sendPresenceUpdate().catch(() => {});
+
+  setInterval(() => sendPresenceUpdate().catch(() => {}), PRESENCE_SEND_INTERVAL);
+  setInterval(() => checkAfkUsers(client).catch((e) => console.error("[AFK] Check error:", e.message)), AFK_CHECK_INTERVAL);
 });
 
 client.on("messageCreate", async (message) => {
@@ -553,18 +749,23 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     eventType = "join"; channelId = newCh.id; channelName = newCh.name;
     color = 0x57f287; title = "เข้าห้อง Voice";
     desc = `**${username}** เข้าห้อง **${newCh.name}**`;
+    updatePresenceJoin(guildId, guildName, newCh.id, newCh.name, member);
   } else if (oldCh && !newCh) {
     eventType = "leave"; channelId = oldCh.id; channelName = oldCh.name;
     color = 0xed4245; title = "ออกจากห้อง Voice";
     desc = `**${username}** ออกจากห้อง **${oldCh.name}**`;
+    updatePresenceLeave(guildId, oldCh.id, member.id);
   } else if (oldCh && newCh && oldCh.id !== newCh.id) {
     eventType = "move"; channelId = newCh.id; channelName = newCh.name;
     fromChannelId = oldCh.id; fromChannelName = oldCh.name;
     color = 0xfee75c; title = "ย้ายห้อง Voice";
     desc = `**${username}** ย้ายจาก **${oldCh.name}** ไปยัง **${newCh.name}**`;
+    updatePresenceLeave(guildId, oldCh.id, member.id);
+    updatePresenceJoin(guildId, guildName, newCh.id, newCh.name, member);
   } else {
     return;
   }
+  sendPresenceUpdate().catch(() => {});
 
   await logEvent({
     eventType, userId: member.id, username, avatarUrl,
